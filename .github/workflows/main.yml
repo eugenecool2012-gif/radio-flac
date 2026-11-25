@@ -1,5 +1,11 @@
 name: Build Windows portable
 
+# Собирает portable radio-flac для Windows 10/11:
+#   radio-flac-gui.exe  — интерфейс (GTK4 + libadwaita + GStreamer)
+#   radio-flac.exe      — консольный рекордер
+#   ffmpeg.exe, ffprobe.exe
+# Запуск: тег v* (создаст Release) или вручную из вкладки Actions.
+
 on:
   push:
     tags: ["v*"]
@@ -18,33 +24,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: MSYS2 + GTK4/GStreamer
+      # Только поднимаем окружение MSYS2. Пакеты ставим отдельным шагом,
+      # чтобы любой сбой pacman был виден в своём логе, а не внутри экшена.
+      - name: MSYS2 bootstrap
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: false
-          install: >-
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-python-pip
-            mingw-w64-x86_64-python-gobject
-            mingw-w64-x86_64-gtk4
-            mingw-w64-x86_64-libadwaita
-            mingw-w64-x86_64-gdk-pixbuf2
-            mingw-w64-x86_64-gstreamer
-            mingw-w64-x86_64-gst-plugins-base
-            mingw-w64-x86_64-gst-plugins-good
-            mingw-w64-x86_64-gst-plugins-bad
-            mingw-w64-x86_64-gst-plugins-ugly
-            mingw-w64-x86_64-gst-libav
-            mingw-w64-x86_64-adwaita-icon-theme
-            mingw-w64-x86_64-hicolor-icon-theme
-            mingw-w64-x86_64-upx
+
+      - name: Установка пакетов
+        run: |
+          pacman -S --noconfirm --needed --disable-download-timeout \
+            mingw-w64-x86_64-python \
+            mingw-w64-x86_64-python-pip \
+            mingw-w64-x86_64-python-gobject \
+            mingw-w64-x86_64-gtk4 \
+            mingw-w64-x86_64-libadwaita \
+            mingw-w64-x86_64-gdk-pixbuf2 \
+            mingw-w64-x86_64-gstreamer \
+            mingw-w64-x86_64-gst-plugins-base \
+            mingw-w64-x86_64-gst-plugins-good \
+            mingw-w64-x86_64-gst-plugins-bad \
+            mingw-w64-x86_64-gst-plugins-ugly \
+            mingw-w64-x86_64-gst-libav \
+            mingw-w64-x86_64-adwaita-icon-theme \
+            mingw-w64-x86_64-hicolor-icon-theme \
+            mingw-w64-x86_64-upx \
             unzip
+
+      - name: Проверка GTK/Python
+        run: |
+          echo "--- python"
+          python --version
+          echo "--- gtk"
+          python -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); gi.require_version('Gst','1.0'); from gi.repository import Gtk, Adw, Gst; print('GTK', Gtk.get_major_version(), Gtk.get_minor_version()); print('Adw', Adw.MAJOR_VERSION, Adw.MINOR_VERSION); print('Gst', Gst.version_string())"
+          echo "--- pkg-config"
+          pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0
 
       - name: PyInstaller
         run: |
-          python -m pip install --upgrade pip pyinstaller
-          python -c "import gi; print('pygobject ok')"
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
           python -m PyInstaller --version
 
       - name: Подготовка entry-скриптов
@@ -54,37 +74,37 @@ jobs:
 
       - name: Сборка GUI
         run: |
-          export PATH="/mingw64/bin:$PATH"
           python -m PyInstaller --noconfirm --clean radio-flac.spec
 
       - name: Сборка CLI
         run: |
-          export PATH="/mingw64/bin:$PATH"
           python -m PyInstaller --noconfirm --clean --onefile --console \
             --name radio-flac --exclude-module tkinter --exclude-module gi \
             radio_flac_cli.py
 
       - name: ffmpeg
         run: |
-          curl -L -o ff.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          curl -L --retry 3 -o ff.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
           unzip -q ff.zip -d ff
           find ff -name 'ffmpeg.exe' -exec cp {} dist/ \;
           find ff -name 'ffprobe.exe' -exec cp {} dist/ \;
           ls -la dist/
 
       - name: Собрать portable zip
+        shell: bash
         run: |
           cp README.md dist/ || true
           cd dist
           7z a -tzip ../radio-flac-portable-windows.zip *
           cd ..
-          ls -la radio-flac-portable-windows.zip
+          ls -lh radio-flac-portable-windows.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: radio-flac-portable-windows
           path: radio-flac-portable-windows.zip
           if-no-files-found: error
+          retention-days: 30
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
