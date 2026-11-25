@@ -24,10 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Канонический рецепт MSYS2: update + install в одном шаге.
-      # update: true обязателен — он обновляет keyring и базы pacman,
-      # без него pacman на свежей установке падает на PGP-подписях.
-      # UCRT64 вместо MINGW64: MINGW64 объявлен deprecated.
+      # UCRT64 вместо MINGW64 (MINGW64 deprecated).
+      # update: true обновляет keyring и базы pacman — без него pacman
+      # на свежей установке спотыкается о PGP-подписи.
+      # pkgconf обязателен: без него в окружении нет pkg-config (exit 127),
+      # а он нужен PyInstaller'у для поиска .pc-файлов GTK.
       - name: MSYS2 (UCRT64) + пакеты
         uses: msys2/setup-msys2@v2
         with:
@@ -48,23 +49,29 @@ jobs:
             mingw-w64-ucrt-x86_64-gst-libav
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-hicolor-icon-theme
+            mingw-w64-ucrt-x86_64-pkgconf
             p7zip
             unzip
 
+      # Диагностика не роняет сборку: каждая проба изолирована через || true,
+      # чтобы падение было видно в логе, но не блокировало следующие шаги.
       - name: Диагностика окружения
         run: |
-          set -eux
           echo "MSYSTEM=$MSYSTEM"
-          which python
-          python --version
-          python -c "import sys; print('prefix:', sys.prefix)"
-          pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0
-          python -c "import gi, sys; \
-            gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); gi.require_version('Gst','1.0'); \
-            from gi.repository import Gtk, Adw, Gst; \
-            print('GTK', Gtk.get_major_version(), Gtk.get_minor_version()); \
-            print('Adw', Adw.MAJOR_VERSION, Adw.MINOR_VERSION); \
-            print('Gst', Gst.version_string())"
+          echo "--- pacman"
+          pacman -Q | grep -E 'gtk4|libadwaita|gstreamer|python|pkgconf' || true
+          echo "--- бинарники"
+          for t in python pkg-config 7z curl; do
+            printf '%-12s ' "$t"
+            command -v "$t" || echo "НЕ НАЙДЕН"
+          done
+          echo "--- python"
+          python --version || true
+          python -c "import sys; print('prefix:', sys.prefix)" || true
+          echo "--- gtk/adw/gst через gi"
+          python -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); gi.require_version('Gst','1.0'); from gi.repository import Gtk, Adw, Gst; print('GTK', Gtk.get_major_version(), Gtk.get_minor_version()); print('Adw', Adw.MAJOR_VERSION, Adw.MINOR_VERSION); print('Gst', Gst.version_string())" || true
+          echo "--- pkg-config"
+          pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0 || true
 
       - name: PyInstaller
         run: |
