@@ -1,8 +1,8 @@
 name: Build Windows portable
 
-# Собирает portable radio-flac для Windows 10/11:
-#   radio-flac-gui.exe  — интерфейс (GTK4 + libadwaita + GStreamer)
-#   radio-flac.exe      — консольный рекордер
+# Portable radio-flac для Windows 10/11:
+#   radio-flac-gui.exe — интерфейс (GTK4 + libadwaita + GStreamer)
+#   radio-flac.exe     — консольный рекордер
 #   ffmpeg.exe, ffprobe.exe
 # Запуск: тег v* (создаст Release) или вручную из вкладки Actions.
 
@@ -24,42 +24,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Только поднимаем окружение MSYS2. Пакеты ставим отдельным шагом,
-      # чтобы любой сбой pacman был виден в своём логе, а не внутри экшена.
-      - name: MSYS2 bootstrap
+      # Канонический рецепт MSYS2: update + install в одном шаге.
+      # update: true обязателен — он обновляет keyring и базы pacman,
+      # без него pacman на свежей установке падает на PGP-подписях.
+      # UCRT64 вместо MINGW64: MINGW64 объявлен deprecated.
+      - name: MSYS2 (UCRT64) + пакеты
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
-          update: false
-
-      - name: Установка пакетов
-        run: |
-          pacman -S --noconfirm --needed --disable-download-timeout \
-            mingw-w64-x86_64-python \
-            mingw-w64-x86_64-python-pip \
-            mingw-w64-x86_64-python-gobject \
-            mingw-w64-x86_64-gtk4 \
-            mingw-w64-x86_64-libadwaita \
-            mingw-w64-x86_64-gdk-pixbuf2 \
-            mingw-w64-x86_64-gstreamer \
-            mingw-w64-x86_64-gst-plugins-base \
-            mingw-w64-x86_64-gst-plugins-good \
-            mingw-w64-x86_64-gst-plugins-bad \
-            mingw-w64-x86_64-gst-plugins-ugly \
-            mingw-w64-x86_64-gst-libav \
-            mingw-w64-x86_64-adwaita-icon-theme \
-            mingw-w64-x86_64-hicolor-icon-theme \
-            mingw-w64-x86_64-upx \
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-gdk-pixbuf2
+            mingw-w64-ucrt-x86_64-gstreamer
+            mingw-w64-ucrt-x86_64-gst-plugins-base
+            mingw-w64-ucrt-x86_64-gst-plugins-good
+            mingw-w64-ucrt-x86_64-gst-plugins-bad
+            mingw-w64-ucrt-x86_64-gst-plugins-ugly
+            mingw-w64-ucrt-x86_64-gst-libav
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-hicolor-icon-theme
+            p7zip
             unzip
 
-      - name: Проверка GTK/Python
+      - name: Диагностика окружения
         run: |
-          echo "--- python"
+          set -eux
+          echo "MSYSTEM=$MSYSTEM"
+          which python
           python --version
-          echo "--- gtk"
-          python -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); gi.require_version('Gst','1.0'); from gi.repository import Gtk, Adw, Gst; print('GTK', Gtk.get_major_version(), Gtk.get_minor_version()); print('Adw', Adw.MAJOR_VERSION, Adw.MINOR_VERSION); print('Gst', Gst.version_string())"
-          echo "--- pkg-config"
+          python -c "import sys; print('prefix:', sys.prefix)"
           pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0
+          python -c "import gi, sys; \
+            gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); gi.require_version('Gst','1.0'); \
+            from gi.repository import Gtk, Adw, Gst; \
+            print('GTK', Gtk.get_major_version(), Gtk.get_minor_version()); \
+            print('Adw', Adw.MAJOR_VERSION, Adw.MINOR_VERSION); \
+            print('Gst', Gst.version_string())"
 
       - name: PyInstaller
         run: |
@@ -91,7 +96,6 @@ jobs:
           ls -la dist/
 
       - name: Собрать portable zip
-        shell: bash
         run: |
           cp README.md dist/ || true
           cd dist
