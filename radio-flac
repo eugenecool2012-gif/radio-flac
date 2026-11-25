@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""
+radio-flac — слушает интернет-радио и пишет каждую песню отдельным .flac
+
+ICY-метаданные потока дают название трека; на каждой смене названия
+текущий FLAC закрывается и начинается новый — с тегами исполнителя
+и названия. Поток, который уже идёт во FLAC, копируется без перекодирования.
+
+Примеры:
+  radio-flac https://ice1.somafm.com/groovesalad-128-mp3 -d ~/Музыка/Radio
+  radio-flac https://dfm-disc90.hostingradio.ru/disc9096.aacp -d ~/Музыка/DFM --min-duration 30
+"""
+import argparse
+import datetime
+import os
+import re
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+UA = "radio-flac/1.0 (+linux)"
+
+
+def _tool(name):
+    """Ищем бинарник рядом с исполняемым файлом (portable-сборка), иначе — PATH."""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None
+    if base:
+        for cand in (name + ".exe", name):
+            p = os.path.join(base, cand)
+            if os.path.exists(p):
+                return p
+    return name
+
+
+FFMPEG = _tool("ffmpeg")
+FFPROBE = _tool("ffprobe")
+
+BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+CT_MAP = {
+    "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/x-mpeg": "mp3",
+    "audio/aac": "aac", "audio/aacp": "aac", "audio/x-aac": "aac", "audio/aac+": "aac",
+    "audio/ogg": "ogg", "application/ogg": "ogg", "audio/opus": "ogg",
+    "audio/vorbis": "ogg",
+    "audio/flac": "flac", "audio/x-flac": "flac",
+}
+stop = False
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def _on_signal(*_):
+    global stop
+    stop = True
+
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGINT, _on_signal)
+
+
+class HlsDetected(Exception):
+    """Поток оказался HLS-плейлистом — его читает HlsReader."""
+
+
+def connect(url, depth=0):
+    """Открывает поток, возвращает (socket, headers, уже прочитанный хвост)."""
+    if depth > 5:
+        raise IOError("слишком много редиректов")
+    p = urllib.parse.urlsplit(url)
+    host, port = p.hostname, p.port or (443 if p.scheme == "https" else 80)
+    path = (p.path or "/") + (("?" + p.query) if p.query else "")
+    sock = socket.create_connection((host, port), timeout=20)
+    if p.scheme == "https":
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    req = (f"GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: {UA}\r\n"
+           "Icy-MetaData: 1\r\nAccept: */*\r\n\r\n")
+    sock.sendall(req.encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise IOError("поток закрылся до заголовков")
+        buf += chunk
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.decode("latin-1").split("\r\n")
+    status = lines[0]
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    m = re.search(r"\b(\d{3})\b", status)
+    code = m.group(1) if m else "200"
+    if code in ("301", "302", "303", "307", "308") and headers.get("location"):
+        sock.close()
+        return connect(urllib.parse.urljoin(url, headers["location"]), depth + 1)
+    if code not in ("200", "206"):
+        sock.close()
+        raise IOError(f"HTTP {code}: {status}")
+    ctype = headers.get("content-type", "").lower()
+    if "mpegurl" in ctype or "vnd.apple" in ctype:
+        sock.close()
+        raise HlsDetected(url)
+    if "audio" not in ctype and "ogg" not in ctype:
+        sock.close()
+        raise IOError(f"не аудиопоток: content-type={headers.get('content-type')}")
+    return sock, headers, rest
+
+
+def safe(name, maxlen=120):
+    name = BAD.sub("_", name).strip(" .")
+    return (name[:maxlen] or "track").rstrip(" .")
+
+
+def valid_audio(path):
+    """Файл действительно содержит звук (а не обрезанный огрызок)."""
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30)
+        dur = r.stdout.strip()
+        if r.returncode == 0 and dur and dur != "N/A":
+            return float(dur) > 1.0
+        # длительность не определилась — считаем пакеты
+        c = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "a:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30)
+        return c.returncode == 0 and int(c.stdout.strip() or 0) > 20
+    except (ValueError, subprocess.SubprocessError):
+        return False
+
+
+class HlsReader:
+    """HLS: тянет плейлист и сегменты AAC, название берёт из EXT-X-RADIOCAST-NOW."""
+
+    def __init__(self, url, ua=UA):
+        self.url = url
+        self.ua = ua
+        self.media_url = url
+        self.segments = []
+        self.seen = set()
+        self.title = ""
+        self.target = 6.0
+
+    def _fetch(self, url, timeout=20):
+        req = urllib.request.Request(url, headers={"User-Agent": self.ua})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.read()
+
+    def connect(self):
+        text = self._fetch(self.url).decode("utf-8", "replace")
+        if "#EXT-X-STREAM-INF" in text:
+            best_bw, best_uri = -1, None
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            for index, line in enumerate(lines):
+                if not line.startswith("#EXT-X-STREAM-INF"):
+                    continue
+                match = re.search(r"BANDWIDTH=(\d+)", line)
+                bandwidth = int(match.group(1)) if match else 0
+                if index + 1 < len(lines) and not lines[index + 1].startswith("#"):
+                    if bandwidth > best_bw:
+                        best_bw = bandwidth
+                        best_uri = urllib.parse.urljoin(self.url, lines[index + 1])
+            if not best_uri:
+                raise IOError("в master-плейлисте нет вариантов потока")
+            self.media_url = best_uri
+            text = self._fetch(self.media_url).decode("utf-8", "replace")
+        self._parse(text)
+        for segment in self.segments[:-1]:  # начинаем с живого края
+            self.seen.add(segment)
+        return self
+
+    def _parse(self, text):
+        self.segments = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-TARGETDURATION:"):
+                try:
+                    self.target = float(line.split(":", 1)[1])
+                except ValueError:
+                    pass
+            match = re.search(r'TITLE="([^"]*)"', line)
+            if match:
+                self.title = match.group(1)
+            elif line and not line.startswith("#"):
+                self.segments.append(urllib.parse.urljoin(self.media_url, line))
+
+    def poll(self):
+        text = self._fetch(self.media_url).decode("utf-8", "replace")
+        self._parse(text)
+        new = [segment for segment in self.segments if segment not in self.seen]
+        self.seen.update(new)
+        return new, self.title
+
+    def segment(self, url):
+        return self._fetch(url)
+
+
+def run_hls(args_url, args):
+    """Запись станции, которая отдаёт HLS-плейлист вместо ICY-потока."""
+    try:
+        reader = HlsReader(args_url).connect()
+    except Exception as e:  # noqa: BLE001
+        log("HLS недоступен:", e)
+        return 1
+    log(f"поток: HLS, сегменты ~{reader.target:.0f} c, названия треков: "
+        f"{'есть' if reader.title else 'нет'}")
+
+    rec = Recorder(args, "aac")
+    state = {"started": False, "waiting": None, "waiting_since": time.time(),
+             "skip_until": 0.0, "title": ""}
+
+    def begin(title):
+        artist, name = parse_title(title)
+        if args.lead:
+            state["skip_until"] = time.time() + args.lead
+            log(f"· пропускаю первые {args.lead:g} c трека")
+        rec.start(artist, name)
+        state["started"] = True
+        state["title"] = title
+
+    while not stop:
+        try:
+            segments, title = reader.poll()
+        except Exception as e:  # noqa: BLE001
+            log("ошибка плейлиста:", e, "— повтор через 5 c")
+            time.sleep(5)
+            continue
+
+        if title and title != state["title"]:
+            if not state["started"]:
+                if args.full_tracks and state["waiting"] is None:
+                    state["waiting"] = title
+                    state["waiting_since"] = time.time()
+                    state["title"] = title
+                    log(f"· сейчас играет «{title}» — начну писать со следующего трека")
+                else:
+                    if args.full_tracks:
+                        log("· новый трек — начинаю запись с начала")
+                    begin(title)
+            elif time.time() - rec.started >= args.min_duration:
+                begin(title)
+            else:
+                log("· трек короче минимума — подожду следующей смены")
+
+        for segment in segments:
+            try:
+                data = reader.segment(segment)
+            except Exception as e:  # noqa: BLE001
+                log("сегмент не скачался:", e)
+                continue
+            if state["skip_until"]:
+                if time.time() < state["skip_until"]:
+                    continue
+                # lead истёк — даём декодеру ещё 0.5 сек на синхронизацию
+                state["skip_until"] = time.time() + 0.5
+            if state["started"]:
+                rec.write(data)
+
+        waited = time.time() - state["waiting_since"]
+        if not state["started"] and waited > args.max_wait:
+            log(f"· {args.max_wait} c без названий/смены трека — пишу сплошняком")
+            begin(state["title"] or f"{args.station} {time.strftime('%Y-%m-%d %H-%M')}")
+        elif state["started"] and args.split_every and rec.proc and \
+                time.time() - rec.started >= args.split_every:
+            log(f"· отрезок {args.split_every} c — закрываю файл")
+            begin(state["title"])
+
+        if not segments:
+            time.sleep(max(1.0, min(reader.target / 3, 4.0)))
+
+    rec.close()
+    log("остановлено")
+    return 0
+
+
+def parse_title(raw):
+    """'Artist - Title' → (artist, title)"""
+    if not raw:
+        return "", ""
+    if " - " in raw:
+        artist, title = raw.split(" - ", 1)
+        return artist.strip(), title.strip()
+    return "", raw.strip()
+
+
+class Recorder:
+    """Один трек = один ffmpeg-процесс (вход pipe:0, выход .flac)."""
+
+    def __init__(self, args, fmt):
+        self.args, self.fmt = args, fmt
+        self.proc = None
+        self.path = None
+        self.title = ""
+        self.artist = ""
+        self.started = 0.0
+
+    def start(self, artist, title):
+        self.close()
+        self.title, self.artist = title or "", artist or ""
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        label = f"{stamp} {self._label()}"
+        self.path = os.path.join(self.args.directory, safe(label) + ".flac")
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+               "-f", self.fmt, "-i", "pipe:0", "-c:a", "flac",
+               "-compression_level", str(self.args.compression)]
+        if self.fmt != "flac":  # lossless-поток оставляем в его битности
+            cmd += ["-sample_fmt", "s16"]
+        cmd += ["-metadata", f"stream={self.args.station}"]
+        if title:
+            cmd += ["-metadata", f"title={title}"]
+        if artist:
+            cmd += ["-metadata", f"artist={artist}"]
+        cmd += ["-f", "flac", self.path]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self.started = time.time()
+        log("→ запись:", os.path.basename(self.path))
+
+    def _label(self):
+        if self.artist and self.title:
+            return f"{self.artist} - {self.title}"
+        return self.title or "unknown"
+
+    def write(self, data):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write(data)
+            except (BrokenPipeError, ValueError):
+                pass
+
+    def close(self):
+        if not self.proc:
+            return
+        proc, path, started = self.proc, self.path, self.started
+        self.proc, self.path = None, None
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        if not path or not os.path.exists(path):
+            return
+        dur = time.time() - started
+        size = os.path.getsize(path)
+        if size < 4096 or not valid_audio(path):
+            log("✗ пустой трек, удалён:", os.path.basename(path))
+            os.unlink(path)
+            return
+        if dur < self.args.min_duration:
+            base, ext = os.path.splitext(path)
+            os.rename(path, base + " (фрагмент)" + ext)
+            log("… фрагмент:", os.path.basename(base), f"({dur:.0f} c)")
+        else:
+            log("✓ готово:", os.path.basename(path), f"({dur:.0f} c, {size/1e6:.1f} МБ)")
+
+
+def parse_meta(block):
+    """StreamTitle='Artist - Title' -> (artist, title) или None."""
+    parts = block.split(b"StreamTitle='", 1)
+    if len(parts) < 2:
+        return None
+    raw = parts[1].split(b"';", 1)[0].decode("utf-8", "replace").strip()
+    if not raw:
+        return None
+    if " - " in raw:
+        a, t = raw.split(" - ", 1)
+        return a.strip(), t.strip()
+    return "", raw
+
+
+def search_stations(name, limit=15):
+    """Ищет станции в radio-browser и печатает готовые URL."""
+    import json
+    import urllib.request
+    q = urllib.parse.urlencode({"name": name, "limit": limit,
+                                "order": "clickcount", "reverse": "true",
+                                "hidebroken": "true"})
+    req = urllib.request.Request(
+        f"https://de1.api.radio-browser.info/json/stations/search?{q}",
+        headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.load(r)
+    except Exception as e:
+        print("не удалось спросить radio-browser:", e)
+        return 1
+    if not data:
+        print(f"по запросу «{name}» ничего не найдено")
+        return 1
+    for s in data:
+        meta = "с названиями" if s.get("codec") in ("MP3", "AAC", "AAC+", "OGG") else "сплошняком"
+        print(f"{s['name'][:38]:40} {s['codec']:5} {str(s.get('bitrate') or ''):>4} "
+              f"{meta:13} {s['url_resolved']}")
+    print("\nЗапись:  radio-flac <URL> -d ~/Музыка/Radio -n \"имя станции\"")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Запись интернет-радио в отдельные FLAC-файлы")
+    ap.add_argument("url", nargs="?", help="адрес потока станции")
+    ap.add_argument("-f", "--find", metavar="ИМЯ",
+                    help="найти станции в базе radio-browser и показать их URL")
+    ap.add_argument("-d", "--directory", default=os.path.expanduser("~/Музыка/Radio"))
+    ap.add_argument("-n", "--station", default="", help="имя станции для тега stream")
+    ap.add_argument("--min-duration", type=int, default=20,
+                    help="короче — в файл ' (фрагмент)' (сек, по умолчанию 20)")
+    ap.add_argument("--split-every", type=int, default=0,
+                    help="резать файл каждые N секунд, даже если название трека не меняется "
+                         "(0 = выключено; нужно для станций без метаданных)")
+    ap.add_argument("--full-tracks", action="store_true",
+                    help="не писать трек, начавшийся до запуска: ждать смены названия "
+                         "и сохранять только целые треки")
+    ap.add_argument("--lead", type=float, default=0.0,
+                    help="пропустить первые N секунд после объявления трека — убирает "
+                         "хвост предыдущей песни, если станция объявляет заранее")
+    ap.add_argument("--max-wait", type=int, default=900,
+                    help="сколько ждать смены трека в режиме --full-tracks (сек, по умолчанию 900)")
+    ap.add_argument("--metadata-timeout", type=int, default=20,
+                    help="если названий нет столько секунд — писать сплошняком (по умолчанию 20)")
+    ap.add_argument("--compression", type=int, default=5, help="FLAC compression_level 0-12")
+    ap.add_argument("--retries", type=int, default=0, help="0 = переподключаться бесконечно")
+    args = ap.parse_args()
+    if args.find:
+        return search_stations(args.find)
+    if not args.url:
+        ap.error("нужен адрес потока (или -f ИМЯ, чтобы найти станцию)")
+    args.station = args.station or urllib.parse.urlsplit(args.url).hostname
+    os.makedirs(args.directory, exist_ok=True)
+
+    fails = 0
+    while not stop:
+        try:
+            sock, headers, rest = connect(args.url)
+            fmt = CT_MAP.get(headers.get("content-type", "").split(";")[0].strip().lower(), "mp3")
+            metaint = int(headers.get("icy-metaint", 0) or 0)
+            log(f"поток: {headers.get('icy-name', args.station)} [{fmt}], "
+                f"метаданные: {'есть, каждые %d Б' % metaint if metaint else 'нет'}")
+            rec = Recorder(args, fmt)
+            buf = rest
+            fails = 0
+            started_at = time.time()
+            warned = False
+            waiting_title = None   # для --full-tracks: трек, который играет, но не пишется
+            waiting_since = 0.0
+            split = fmt != "ogg"  # ogg/flac нельзя начинать с середины потока
+            pending = bytearray()
+            dropping = [bool(args.full_tracks and split and metaint)]
+            skip_until = [0.0]
+            state = {"started": False}
+            pending_start = [None]
+
+            def emit(data):
+                if skip_until[0]:
+                    if time.time() < skip_until[0]:
+                        return  # догоняем сдвиг: хвост предыдущего трека не нужен
+                    # lead истёк — даём декодеру ещё 0.5 сек на синхронизацию
+                    skip_until[0] = time.time() + 0.5
+                    if pending_start[0] is not None:
+                        artist, title = pending_start[0]
+                        pending_start[0] = None
+                        pending.clear()  # всё, что накопилось до сдвига, не пишем
+                        rec.start(artist, title)
+                if rec.proc:
+                    rec.write(data)
+                elif dropping[0]:
+                    return  # ждём начала следующего трека — чужое аудио не копим
+                else:  # копим начало потока, чтобы ffmpeg увидел заголовки
+                    pending.extend(data)
+                    if len(pending) > 4_000_000:
+                        del pending[:-4_000_000]
+
+            def begin(artist, title):
+                dropping[0] = False
+                state["started"] = True
+                if args.lead:
+                    pending_start[0] = (artist, title)
+                    skip_until[0] = time.time() + args.lead
+                    log(f"· пропускаю первые {args.lead:g} c трека")
+                    return
+                rec.start(artist, title)
+                if pending:
+                    rec.write(bytes(pending))
+                    pending.clear()
+
+            if not split:  # ogg/flac нельзя начинать с середины потока
+                begin("", f"{args.station} {time.strftime('%Y-%m-%d %H-%M')}")
+            elif not metaint:  # названий не будет вовсе — пишем сразу
+                begin("", f"{args.station} {time.strftime('%Y-%m-%d %H-%M')}")
+
+            while not stop:
+                if metaint:
+                    while len(buf) < metaint:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            raise IOError("поток оборвался")
+                        buf += chunk
+                    emit(buf[:metaint])
+                    buf = buf[metaint:]
+                    while len(buf) < 1:
+                        buf += sock.recv(65536)
+                    mlen = buf[0] * 16
+                    buf = buf[1:]
+                    while len(buf) < mlen:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            raise IOError("поток оборвался")
+                        buf += chunk
+                    meta, buf = buf[:mlen], buf[mlen:]
+                    parsed = parse_meta(meta) if mlen else None
+                    if parsed and split:
+                        artist, title = parsed
+                        current = pending_start[0] or (
+                            (rec.artist, rec.title) if rec.proc is not None else None)
+                        if state["started"] and current is not None:
+                            if title and (artist, title) != current:
+                                if pending_start[0] is not None or \
+                                        time.time() - rec.started >= args.min_duration:
+                                    begin(artist, title)
+                                else:
+                                    log("· трек короче минимума — подожду следующей смены")
+                        elif args.full_tracks:
+                            if waiting_title is None:
+                                waiting_title = (artist, title)
+                                waiting_since = time.time()
+                                log(f"· сейчас играет «{title}» — начну писать со следующего трека")
+                            elif (artist, title) != waiting_title:
+                                log("· новый трек — начинаю запись с начала")
+                                begin(artist, title)
+                        else:
+                            begin(artist, title)
+                else:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise IOError("поток оборвался")
+                    emit(chunk)
+                if rec.proc is None and pending_start[0] is None:
+                    waited = time.time() - started_at
+                    if args.full_tracks and split:
+                        if waiting_title is None:
+                            if not warned and waited > args.metadata_timeout:
+                                log("· станция пока не объявила трек — жду первого названия")
+                                warned = True
+                            if waited > args.max_wait:
+                                log(f"· {args.max_wait} c без названий — пишу сплошняком")
+                                begin("", f"{args.station} {time.strftime('%Y-%m-%d %H-%M')}")
+                        elif time.time() - waiting_since > args.max_wait:
+                            log(f"· {args.max_wait} c без смены трека — начинаю писать с середины")
+                            begin(*waiting_title)
+                    elif waited > args.metadata_timeout:
+                        if metaint and not warned:
+                            log("станция не сообщает названия треков — файл будет один. "
+                                "Для нарезки по времени добавьте --split-every 180")
+                            warned = True
+                        begin("", f"{args.station} {time.strftime('%Y-%m-%d %H-%M')}")
+                elif rec.proc is not None and args.split_every and \
+                        time.time() - rec.started >= args.split_every:
+                    log(f"· отрезок {args.split_every} c — закрываю файл")
+                    begin(rec.artist, rec.title)
+            rec.close()  # по сигналу докатываем текущий трек, а не выбрасываем
+            sock.close()
+        except HlsDetected:
+            return run_hls(args.url, args)
+        except Exception as e:
+            if stop:
+                break
+            fails += 1
+            log("ошибка:", e, "— переподключение через 5 c")
+            time.sleep(5)
+            if args.retries and fails >= args.retries:
+                return 1
+    log("остановлено")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

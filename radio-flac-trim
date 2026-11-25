@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""
+radio-flac-trim — срезает начало уже записанных FLAC-файлов.
+
+Нужен, если станция объявляет трек заранее и в начале файла остался
+хвост предыдущей песни.
+
+  radio-flac-trim 3 ~/Музыка/Radio/*.flac     # срезать 3 секунды
+  radio-flac-trim 3 --in-place ~/Музыка/Radio # все .flac в папке
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+
+def trim(path, seconds, in_place):
+    base, ext = os.path.splitext(path)
+    out = base + ".trim" + ext if in_place else base + " (обрезан)" + ext
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+         "-af", f"atrim=start={seconds},asetpts=PTS-STARTPTS",
+         "-c:a", "flac", "-compression_level", "5", out],
+        capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(out):
+        print(f"  ✗ {os.path.basename(path)}: {result.stderr.strip()[:120]}")
+        return False
+    if in_place:
+        os.replace(out, path)
+    dur = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "csv=p=0", base + (".trim" if in_place else " (обрезан)") + ext],
+                         capture_output=True, text=True).stdout.strip()
+    print(f"  ✓ {os.path.basename(path)} → {float(dur or 0):.1f} c")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Срезать начало FLAC-записей радио")
+    ap.add_argument("seconds", type=float, help="сколько секунд срезать")
+    ap.add_argument("files", nargs="+", help="файлы или папки")
+    ap.add_argument("--in-place", action="store_true", help="перезаписать исходные файлы")
+    args = ap.parse_args()
+
+    targets = []
+    for path in args.files:
+        if os.path.isdir(path):
+            targets += sorted(os.path.join(path, f) for f in os.listdir(path)
+                              if f.lower().endswith(".flac"))
+        else:
+            targets.append(path)
+
+    ok = 0
+    for path in targets:
+        if trim(path, args.seconds, args.in_place):
+            ok += 1
+    print(f"\nобрезано файлов: {ok} из {len(targets)}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

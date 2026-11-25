@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Radio FLAC
+Comment=Слушать интернет-радио и писать треки в FLAC
+Exec=radio-flac-gui
+Icon=radio
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=radio;flac;record;
